@@ -24,7 +24,9 @@ from fastapi.responses import JSONResponse
 
 from fastapi.responses import StreamingResponse
 from cbse_kb import get_subjects, get_chapters, retrieve_context
-from grading_prompts import handwriting_prompt
+from grading_prompts import handwriting_prompt, build_exam_constraints
+from grade_profiles import get_profile, build_tier_label
+import exam_config_store
 from llm_router import grade_handwriting, QuotaExceeded
 from nlp_polish import polish_feedback_dict
 from agent_tools import verify_math
@@ -38,10 +40,53 @@ app = FastAPI(title="HandwritingEval — Handwritten answer evaluator")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5182", "http://127.0.0.1:5182"],
+    allow_origins=["http://localhost:5174", "http://127.0.0.1:5174"],
     allow_credentials=True, allow_methods=["*"], allow_headers=["*"],
 )
 
+
+# ── Exam Config endpoints ────────────────────────────────────────────────────
+
+@app.get("/api/exam-config")
+def list_exam_configs():
+    return exam_config_store.list_configs()
+
+
+@app.post("/api/exam-config")
+async def create_exam_config(payload: dict):
+    cid = exam_config_store.save_config(
+        name=payload.get("name", "Untitled"),
+        board=payload.get("board", "CBSE"),
+        grade=payload.get("grade", 1),
+        subject=payload.get("subject", ""),
+        chapter=payload.get("chapter", ""),
+        exam_type=payload.get("exam_type", ""),
+        paper_total=payload.get("paper_total", 100),
+        questions=payload.get("questions", []),
+        instructions=payload.get("instructions", ""),
+        eval_order=payload.get("eval_order", ""),
+        strictness=payload.get("strictness", "moderate"),
+        rules=payload.get("rules", {}),
+        feedback=payload.get("feedback", {}),
+    )
+    return {"id": cid}
+
+
+@app.get("/api/exam-config/{cid}")
+def get_exam_config(cid: int):
+    cfg = exam_config_store.get_config(cid)
+    if not cfg:
+        raise HTTPException(404, "Config not found")
+    return cfg
+
+
+@app.delete("/api/exam-config/{cid}")
+def delete_exam_config(cid: int):
+    exam_config_store.delete_config(cid)
+    return {"ok": True}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 
 @app.get("/api/health")
 def health():
@@ -75,7 +120,9 @@ def _pdf_to_image_pages(raw: bytes, max_pages: int = 16, dpi: int = 150) -> list
 
 
 async def _evaluate_one(filename: str, raw: bytes, declared_mime: str,
-                        question: str, max_marks: int) -> dict[str, Any]:
+                        question: str, max_marks: int,
+                        grade_override: int = 0, subject_override: str = "",
+                        exam_config: dict = None) -> dict[str, Any]:
     """Evaluate a single answer (image or PDF) and return the result dict."""
     if not raw:
         return {"file": filename, "ok": False, "error": "empty file"}
@@ -97,7 +144,10 @@ async def _evaluate_one(filename: str, raw: bytes, declared_mime: str,
     except Exception as e:
         return {"file": filename, "ok": False, "error": f"Could not read file: {e}"}
 
-    sys_prompt = handwriting_prompt(question, max_marks, pdf_mode=is_pdf)
+    sys_prompt = handwriting_prompt(question, max_marks, pdf_mode=is_pdf,
+                                    grade_override=grade_override,
+                                    subject_override=subject_override,
+                                    exam_config=exam_config)
     try:
         result = await asyncio.to_thread(grade_handwriting, sys_prompt, images)
     except QuotaExceeded as e:
@@ -106,7 +156,13 @@ async def _evaluate_one(filename: str, raw: bytes, declared_mime: str,
         return {"file": filename, "ok": False, "error": f"Grading failed: {e}"}
 
     detected = result.get("detected_scope") or {}
-    detected_grade = detected.get("grade") or 6
+    if grade_override > 0:
+        detected["grade"] = grade_override
+        result["detected_scope"] = detected
+    if subject_override:
+        detected["subject"] = subject_override
+        result["detected_scope"] = detected
+    detected_grade = detected.get("grade") or grade_override or 6
 
     # 📚 NCERT-grounding — cross-reference detected chapter to NCERT content
     try:
@@ -136,21 +192,40 @@ async def _evaluate_one(filename: str, raw: bytes, declared_mime: str,
     polish_feedback_dict(result, detected_grade)
     if is_pdf:
         result["source"] = {"type": "pdf", "pages": len(images)}
-    return {"file": filename, "ok": True, **result}
+    return {"file": filename, "ok": True,
+            "grade_tier": build_tier_label(detected_grade),
+            "exam_config_used": exam_config,
+            **result}
 
 
 @app.post("/api/grade/handwriting")
 async def grade(
-    question:  str  = Form(""),
-    max_marks: int  = Form(5),
-    image:     list[UploadFile] = File(...),
+    question:       str  = Form(""),
+    max_marks:      int  = Form(5),
+    grade:          int  = Form(0),
+    subject:        str  = Form(""),
+    exam_config:    str  = Form(""),
+    exam_config_id: int  = Form(0),
+    image:          list[UploadFile] = File(...),
 ):
     """Evaluate one or many handwritten answers.
     `image` accepts a list of files (each evaluated independently).
     Each file may be JPG/PNG/WEBP or a PDF (up to 6 pages).
     """
+    import json as _json
     if not image:
         raise HTTPException(400, "No files uploaded")
+
+    # Resolve exam config: inline JSON > saved DB record > none
+    resolved_config = None
+    if exam_config:
+        try: resolved_config = _json.loads(exam_config)
+        except Exception: pass
+    elif exam_config_id:
+        resolved_config = exam_config_store.get_config(exam_config_id)
+
+    eff_grade   = grade   or (resolved_config or {}).get("grade", 0)
+    eff_subject = subject or (resolved_config or {}).get("subject", "")
 
     # Read all files first so async tasks can run concurrently
     payloads = []
@@ -163,7 +238,9 @@ async def grade(
     async def bounded(payload):
         filename, raw, declared_mime = payload
         async with sem:
-            return await _evaluate_one(filename, raw, declared_mime, question, max_marks)
+            return await _evaluate_one(filename, raw, declared_mime, question, max_marks,
+                                       grade_override=eff_grade, subject_override=eff_subject,
+                                       exam_config=resolved_config)
 
     results = await asyncio.gather(*(bounded(p) for p in payloads))
     graded_count = sum(1 for r in results if r.get("ok"))

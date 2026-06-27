@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from 'react'
+import ExamConfigPanel from '../components/ExamConfigPanel.jsx'
 import Button from '../ui/Button.jsx'
 import Card from '../ui/Card.jsx'
 import Field from '../ui/Field.jsx'
@@ -16,6 +17,9 @@ export default function Evaluator({ onHome }) {
   const { push } = useToast()
   const [question, setQ]      = useState('')
   const [maxMarks, setMax]    = useState(5)
+  const [gradeVal, setGrade]  = useState('')
+  const [subjectVal, setSubject] = useState('')
+  const [examConfig, setExamConfig] = useState({})
   const [files, setFiles]     = useState([])
   const [showMarks, setShowMarks] = useState(false)
   const [openIdx, setOpenIdx] = useState(0)
@@ -40,6 +44,11 @@ export default function Evaluator({ onHome }) {
     const fd = new FormData()
     fd.append('question', question)
     fd.append('max_marks', String(maxMarks))
+    fd.append('grade', String(parseInt(gradeVal) || (examConfig.grade || 0)))
+    fd.append('subject', subjectVal.trim() || (examConfig.subject || ''))
+    if (examConfig && Object.keys(examConfig).length) {
+      fd.append('exam_config', JSON.stringify(examConfig))
+    }
     files.forEach(f => fd.append('image', f, f.name))
     const r = await fetch('/api/grade/handwriting', { method: 'POST', body: fd, signal })
     if (!r.ok) throw new Error(`HTTP ${r.status}: ${(await r.text()).slice(0, 200)}`)
@@ -139,6 +148,41 @@ export default function Evaluator({ onHome }) {
                        disabled={evalApi.loading}/>
               )}
             </Field>
+
+            <ExamConfigPanel value={examConfig} onChange={setExamConfig} apiBase="/api" />
+
+            <div className="override-row">
+              <div className="override-field">
+                <label className="override-label">
+                  🏫 Class / Grade
+                  <span className="total-marks-hint">(optional — prevents wrong class detection)</span>
+                </label>
+                <input
+                  type="number"
+                  className="total-marks-input"
+                  placeholder="e.g. 10"
+                  min="1" max="12"
+                  value={gradeVal}
+                  onChange={e => setGrade(e.target.value)}
+                  disabled={evalApi.loading}
+                />
+              </div>
+              <div className="override-field">
+                <label className="override-label">
+                  📚 Subject
+                  <span className="total-marks-hint">(optional)</span>
+                </label>
+                <select className="total-marks-input" value={subjectVal}
+                        onChange={e => setSubject(e.target.value)}
+                        disabled={evalApi.loading}>
+                  <option value="">Auto-detect</option>
+                  {['English','Mathematics','Science','Physics','Chemistry','Biology',
+                    'Social Science','Hindi','Sanskrit','Computer Science'].map(s => (
+                    <option key={s} value={s}>{s}</option>
+                  ))}
+                </select>
+              </div>
+            </div>
 
             {files.length > 0 && !hasAnyPdf && (
               <label className="verify-toggle">
@@ -263,6 +307,9 @@ function ResultCard({ result, index, isOpen, onToggle, showMarks }) {
         <span className="rc-detected">
           G{ds.grade} · {ds.subject}{ds.chapter ? ` · ${ds.chapter}` : ''}
         </span>
+        {result.grade_tier && (
+          <span className="grade-tier-badge">{result.grade_tier}</span>
+        )}
         {showMarks && (
           <span className="rc-marks">{result.marks_awarded}/{result.marks_total}</span>
         )}
@@ -284,6 +331,22 @@ function ResultCard({ result, index, isOpen, onToggle, showMarks }) {
                      style={{ width: `${Math.max(0, Math.min(100, result.effort_score))}%` }} />
               </div>
               <div className="effort-pct">{result.effort_score}%</div>
+            </div>
+          )}
+
+          {/* Language + format badges */}
+          {(result.detected_language || result.answer_formats_used?.length > 0) && (
+            <div className="format-badges" style={{ marginBottom: 10 }}>
+              {result.detected_language && (
+                <span className="fmt-badge fmt-language" title="Language detected">
+                  🌐 {result.detected_language}
+                </span>
+              )}
+              {result.answer_formats_used?.map(f => (
+                <span key={f} className={`fmt-badge fmt-${f}`}>
+                  {({'text':'📝','diagram':'🖼','table':'📋','math':'🔢','bullets':'📌','hinglish':'🗣','mixed':'🔄'})[f] || '📝'} {f}
+                </span>
+              ))}
             </div>
           )}
 

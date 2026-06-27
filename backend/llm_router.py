@@ -99,6 +99,7 @@ def _try_model(model: str, parts, retries: int = 1, base_wait: float = 1.0):
                 config=gtypes.GenerateContentConfig(
                     response_mime_type="application/json",
                     temperature=0.2,
+                    max_output_tokens=8192,
                 ),
             )
             return True, _extract_json(rsp.text or "")
@@ -134,11 +135,14 @@ def _grade_with_groq_vision(system_prompt: str,
             "image_url": {"url": f"data:{mime or 'image/png'};base64,{b64}"},
         })
 
+    # Estimate tokens needed based on question count in prompt (~100 tokens per question)
+    q_count = len(re.findall(r"Q\d+", system_prompt))
+    groq_max_tokens = max(3000, q_count * 100 + 1500)
     rsp = _groq().chat.completions.create(
         model=model,
         messages=[{"role": "user", "content": content}],
         temperature=0.2,
-        max_tokens=2500,
+        max_tokens=groq_max_tokens,
         response_format={"type": "json_object"},
     )
     return _extract_json(rsp.choices[0].message.content or "")
@@ -183,6 +187,7 @@ def grade_handwriting(system_prompt: str,
         print(f"[gemini] falling through from {model} -> next in chain")
 
     print(f"[gemini] {'skipped (quota block active)' if skip_gemini else ('quota exhausted' if quota_hit else 'all Gemini models failed')} — using Groq Llama-4-Scout vision")
+    groq_err = None
     try:
         result = _grade_with_groq_vision(system_prompt, images)
         if isinstance(result, dict):
@@ -190,6 +195,21 @@ def grade_handwriting(system_prompt: str,
                 "GROQ_VISION_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct")
         return result
     except Exception as e:
+        groq_err = e
+        print(f"[groq vision] failed ({e}) — trying Gemini one more time as final fallback")
+
+    # Final fallback: Gemini again (in case its quota cleared or earlier failure was transient).
+    # We retry the LAST Gemini model in the chain with a fresh attempt.
+    try:
+        last_model = _model_chain()[-1]
+        ok, result = _try_model(last_model, parts, retries=0)
+        if ok:
+            if isinstance(result, dict):
+                result["_fallback_model_used"] = f"{last_model} (retry after Groq failure)"
+            _gemini_quota_blocked_until = 0  # clear circuit-breaker since it worked
+            return result
+        raise result if isinstance(result, Exception) else RuntimeError(str(result))
+    except Exception as ge:
         raise RuntimeError(
-            f"Gemini unavailable AND Groq vision fallback failed. Last Gemini err: {last_err}. Groq err: {e}"
+            f"All providers failed. Gemini: {last_err}. Groq vision: {groq_err}. Gemini retry: {ge}"
         )
